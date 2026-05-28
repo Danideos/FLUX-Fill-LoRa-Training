@@ -16,6 +16,7 @@
 import argparse
 import copy
 import itertools
+import json
 import logging
 import math
 import os
@@ -75,7 +76,199 @@ if is_wandb_available():
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.32.0.dev0")
 
+
 logger = get_logger(__name__)
+
+
+# painting-inpaint pure scaled LaMa mask patch
+IMAGE_SUFFIXES = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
+LAMA_BASE_MASK_SIZE = 256
+
+
+def _scaled_lama_int(value, resolution):
+    return max(1, int(round(value * resolution / LAMA_BASE_MASK_SIZE)))
+
+
+def conditional_resize_for_resolution(image, resolution, interpolation=Image.Resampling.BILINEAR):
+    width, height = image.size
+    if min(width, height) >= resolution:
+        return image
+
+    scale = resolution / min(width, height)
+    new_width = max(resolution, int(round(width * scale)))
+    new_height = max(resolution, int(round(height * scale)))
+    return image.resize((new_width, new_height), interpolation)
+
+
+def crop_params_for_resolution(image, resolution, center_crop=False):
+    width, height = image.size
+    if width < resolution or height < resolution:
+        raise ValueError(
+            f"Image is too small for a {resolution} crop after resize: {width}x{height}"
+        )
+
+    if center_crop:
+        left = max(0, int(round((width - resolution) / 2.0)))
+        top = max(0, int(round((height - resolution) / 2.0)))
+    else:
+        left = random.randint(0, width - resolution)
+        top = random.randint(0, height - resolution)
+
+    return left, top, left + resolution, top + resolution
+
+
+def _make_lama_irregular_mask(size, resolution):
+    width, height = size
+    max_angle = 4
+    min_times = 1
+    max_times = 5
+    max_len = _scaled_lama_int(200, resolution)
+    max_width = _scaled_lama_int(100, resolution)
+
+    mask = Image.new("L", (width, height), 0)
+    draw = ImageDraw.Draw(mask)
+    times = np.random.randint(min_times, max_times + 1)
+    for i in range(times):
+        start_x = int(np.random.randint(width))
+        start_y = int(np.random.randint(height))
+        for _ in range(1 + int(np.random.randint(5))):
+            angle = 0.01 + int(np.random.randint(max_angle))
+            if i % 2 == 0:
+                angle = 2 * math.pi - angle
+            length = 10 + int(np.random.randint(max_len))
+            brush_width = 5 + int(np.random.randint(max_width))
+            end_x = int(np.clip(start_x + length * np.sin(angle), 0, width - 1))
+            end_y = int(np.clip(start_y + length * np.cos(angle), 0, height - 1))
+            draw.line((start_x, start_y, end_x, end_y), fill=255, width=brush_width)
+            start_x, start_y = end_x, end_y
+    return mask
+
+
+def _make_lama_box_mask(size, resolution):
+    width, height = size
+    margin = _scaled_lama_int(10, resolution)
+    bbox_min_size = _scaled_lama_int(30, resolution)
+    bbox_max_size = _scaled_lama_int(150, resolution)
+    min_times = 1
+    max_times = 4
+
+    mask = Image.new("L", (width, height), 0)
+    bbox_max_size = min(bbox_max_size, height - margin * 2, width - margin * 2)
+    if bbox_max_size <= 0:
+        return mask
+    bbox_min_size = min(bbox_min_size, bbox_max_size)
+
+    draw = ImageDraw.Draw(mask)
+    times = np.random.randint(min_times, max_times + 1)
+    for _ in range(times):
+        if bbox_max_size <= bbox_min_size:
+            box_width = bbox_min_size
+            box_height = bbox_min_size
+        else:
+            box_width = int(np.random.randint(bbox_min_size, bbox_max_size))
+            box_height = int(np.random.randint(bbox_min_size, bbox_max_size))
+        max_left = width - margin - box_width
+        max_top = height - margin - box_height
+        if max_left < margin or max_top < margin:
+            continue
+        left = int(np.random.randint(margin, max_left + 1))
+        top = int(np.random.randint(margin, max_top + 1))
+        draw.rectangle((left, top, left + box_width, top + box_height), fill=255)
+    return mask
+
+
+def generate_lama_mask(
+    size,
+    resolution,
+    reject_by_area=False,
+    min_ratio=0.03,
+    max_ratio=0.45,
+    max_attempts=20,
+):
+    """Generate a LaMa abl-04-256-mh-dist mask scaled to ``resolution``.
+
+    Pure LaMa mode does not reject by area. Area rejection is an optional
+    non-baseline variant enabled only by ``--lama_reject_by_area``.
+    """
+
+    attempts = max(1, int(max_attempts)) if reject_by_area else 1
+    last_mask = None
+    for _ in range(attempts):
+        kind = int(np.random.choice(2, p=np.array([0.5, 0.5], dtype="float32")))
+        if kind == 0:
+            mask = _make_lama_irregular_mask(size, resolution)
+        else:
+            mask = _make_lama_box_mask(size, resolution)
+
+        mask = mask.point(lambda value: 255 if value >= 127 else 0).convert("L")
+        last_mask = mask
+        if not reject_by_area:
+            return mask
+
+        coverage = float(np.asarray(mask, dtype=np.uint8).mean() / 255.0)
+        if min_ratio <= coverage <= max_ratio:
+            return mask
+
+    return last_mask
+
+
+def load_folder_mask(mask_data_root, image_path, resized_size, crop_box, flipped=False):
+    if image_path is None:
+        raise ValueError("--mask_source folder requires filesystem image paths.")
+
+    mask_path = Path(mask_data_root) / Path(image_path).name
+    if not mask_path.exists():
+        raise FileNotFoundError(f"Mask not found for {image_path}: {mask_path}")
+
+    mask = Image.open(mask_path).convert("L")
+    mask = conditional_resize_for_resolution(mask, min(resized_size), Image.Resampling.NEAREST)
+    if mask.size != resized_size:
+        mask = mask.resize(resized_size, Image.Resampling.NEAREST)
+    if flipped:
+        mask = mask.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+    return mask.crop(crop_box).point(lambda value: 255 if value >= 127 else 0).convert("L")
+
+
+def mask_image_preview(image, mask):
+    masked = image.copy()
+    black = Image.new("RGB", image.size, (0, 0, 0))
+    masked.paste(black, mask=mask)
+    return masked
+
+
+def save_debug_preprocessed_samples(dataset, output_dir, num_samples):
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+
+    py_state = random.getstate()
+    np_state = np.random.get_state()
+    rows = []
+    try:
+        count = min(max(0, int(num_samples)), len(dataset))
+        for index in range(count):
+            sample = dataset.debug_sample(index)
+            prefix = f"{index:03d}"
+            crop_path = output / f"{prefix}_crop.png"
+            mask_path = output / f"{prefix}_mask.png"
+            masked_path = output / f"{prefix}_masked.png"
+            sample["debug_crop_image"].save(crop_path)
+            sample["debug_mask_image"].save(mask_path)
+            sample["debug_masked_image"].save(masked_path)
+            rows.append(
+                {
+                    "index": index,
+                    "source_path": sample.get("debug_source_path"),
+                    "crop": str(crop_path),
+                    "mask": str(mask_path),
+                    "masked": str(masked_path),
+                    "mask_coverage": sample.get("debug_mask_coverage"),
+                }
+            )
+    finally:
+        random.setstate(py_state)
+        np.random.set_state(np_state)
+
+    (output / "manifest.json").write_text(json.dumps(rows, indent=2, sort_keys=True), encoding="utf-8")
 
 
 def save_model_card(
@@ -310,8 +503,33 @@ def parse_args(input_args=None):
         "--mask_data_dir",
         type=str,
         default=None,
-        help=("A folder containing the mask data. "),
+        help=("A folder containing the mask data. Required only when --mask_source=folder."),
     )
+    parser.add_argument(
+        "--mask_source",
+        type=str,
+        default="folder",
+        choices=["folder", "lama"],
+        help=(
+            "Mask source for inpainting training. 'folder' keeps the original filename-matched "
+            "mask behavior. 'lama' generates fresh scaled LaMa abl-04-256-mh-dist masks per sample."
+        ),
+    )
+    parser.add_argument(
+        "--lama_reject_by_area",
+        action="store_true",
+        help="Optional non-baseline mode: reject generated LaMa masks outside the configured area ratio.",
+    )
+    parser.add_argument("--lama_mask_min_ratio", type=float, default=0.03)
+    parser.add_argument("--lama_mask_max_ratio", type=float, default=0.45)
+    parser.add_argument("--lama_mask_max_attempts", type=int, default=20)
+    parser.add_argument(
+        "--debug_save_preprocessed_samples",
+        type=str,
+        default=None,
+        help="Optional directory where pre-training crop/mask/masked debug PNGs are written.",
+    )
+    parser.add_argument("--debug_num_preprocessed_samples", type=int, default=16)
 
     parser.add_argument(
         "--cache_dir",
@@ -719,8 +937,19 @@ def parse_args(input_args=None):
     if args.dataset_name is not None and args.instance_data_dir is not None:
         raise ValueError("Specify only one of `--dataset_name` or `--instance_data_dir`")
     
-    if args.mask_data_dir is None:
-        raise ValueError("Specify a --mask_data_dir`")
+    if args.mask_source == "folder" and args.mask_data_dir is None:
+        raise ValueError("Specify --mask_data_dir when --mask_source=folder.")
+    if args.lama_mask_min_ratio < 0 or args.lama_mask_max_ratio > 1:
+        raise ValueError("LaMa mask area ratios must be in [0, 1].")
+    if args.lama_mask_min_ratio >= args.lama_mask_max_ratio:
+        raise ValueError("--lama_mask_min_ratio must be smaller than --lama_mask_max_ratio.")
+    if args.lama_mask_max_attempts < 1:
+        raise ValueError("--lama_mask_max_attempts must be at least 1.")
+    if args.cache_latents and (args.mask_source == "lama" or not args.center_crop):
+        raise ValueError(
+            "--cache_latents is incompatible with on-the-fly random crops/masks. "
+            "Disable it, or use --center_crop with --mask_source=folder."
+        )
 
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
@@ -743,8 +972,11 @@ def parse_args(input_args=None):
 
 class DreamBoothDataset(Dataset):
     """
-    A dataset to prepare the instance and class images with the prompts for fine-tuning the model.
-    It pre-processes the images.
+    A dataset to prepare instance and class images with prompts for fine-tuning.
+
+    Instance crops, masks, and masked-image tensors are generated on demand so
+    every sampled image can receive a fresh random crop and, in LaMa mode, a
+    fresh pure scaled LaMa mask.
     """
 
     def __init__(
@@ -758,18 +990,26 @@ class DreamBoothDataset(Dataset):
         size=1024,
         repeats=1,
         center_crop=False,
+        random_flip=False,
+        mask_source="folder",
+        lama_reject_by_area=False,
+        lama_mask_min_ratio=0.03,
+        lama_mask_max_ratio=0.45,
+        lama_mask_max_attempts=20,
     ):
         self.size = size
         self.center_crop = center_crop
-
+        self.random_flip = random_flip
         self.instance_prompt = instance_prompt
         self.mask_data_root = mask_data_root
-
+        self.mask_source = mask_source
+        self.lama_reject_by_area = lama_reject_by_area
+        self.lama_mask_min_ratio = lama_mask_min_ratio
+        self.lama_mask_max_ratio = lama_mask_max_ratio
+        self.lama_mask_max_attempts = lama_mask_max_attempts
         self.custom_instance_prompts = None
         self.class_prompt = class_prompt
 
-        # if --dataset_name is provided or a metadata jsonl file is provided in the local --instance_data directory,
-        # we load the training data using load_dataset
         if args.dataset_name is not None:
             try:
                 from datasets import load_dataset
@@ -779,18 +1019,12 @@ class DreamBoothDataset(Dataset):
                     "captions please install the datasets library: `pip install datasets`. If you wish to load a "
                     "local folder containing images only, specify --instance_data_dir instead."
                 )
-            # Downloading and loading a dataset from the hub.
-            # See more about loading custom images at
-            # https://huggingface.co/docs/datasets/v2.0.0/en/dataset_script
             dataset = load_dataset(
                 args.dataset_name,
                 args.dataset_config_name,
                 cache_dir=args.cache_dir,
             )
-            # Preprocessing the datasets.
             column_names = dataset["train"].column_names
-
-            # 6. Get the column names for input/target.
             if args.image_column is None:
                 image_column = column_names[0]
                 logger.info(f"image column defaulting to {image_column}")
@@ -800,7 +1034,7 @@ class DreamBoothDataset(Dataset):
                     raise ValueError(
                         f"`--image_column` value '{args.image_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
                     )
-            instance_images = dataset["train"][image_column]
+            instance_items = list(dataset["train"][image_column])
 
             if args.caption_column is None:
                 logger.info(
@@ -815,7 +1049,6 @@ class DreamBoothDataset(Dataset):
                         f"`--caption_column` value '{args.caption_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
                     )
                 custom_instance_prompts = dataset["train"][args.caption_column]
-                # create final list of captions according to --repeats
                 self.custom_instance_prompts = []
                 for caption in custom_instance_prompts:
                     self.custom_instance_prompts.extend(itertools.repeat(caption, repeats))
@@ -823,45 +1056,23 @@ class DreamBoothDataset(Dataset):
             self.instance_data_root = Path(instance_data_root)
             if not self.instance_data_root.exists():
                 raise ValueError("Instance images root doesn't exists.")
-
-            # Kreiere eine Liste mit allen Bildern im Ordner
-            self.instance_images_path = list(Path(instance_data_root).iterdir())    ## Meine
-            instance_images = [Image.open(path) for path in list(Path(instance_data_root).iterdir())]
+            instance_items = sorted(
+                [
+                    path
+                    for path in self.instance_data_root.iterdir()
+                    if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES
+                ],
+                key=lambda path: path.name.lower(),
+            )
             self.custom_instance_prompts = None
 
-        self.instance_images = []
-        for img in instance_images:
-            self.instance_images.extend(itertools.repeat(img, repeats))
+        self.instance_items = []
+        for item in instance_items:
+            self.instance_items.extend(itertools.repeat(item, repeats))
 
-        self.pixel_values = []
-        train_resize = transforms.Resize(size, interpolation=transforms.InterpolationMode.BILINEAR)
-        train_crop = transforms.CenterCrop(size) if center_crop else transforms.RandomCrop(size)
-        train_flip = transforms.RandomHorizontalFlip(p=1.0)
-        train_transforms = transforms.Compose(
-            [
-                transforms.ToTensor(),
-                transforms.Normalize([0.5], [0.5]),
-            ]
-        )
-        for image in self.instance_images:
-            image = exif_transpose(image)
-            if not image.mode == "RGB":
-                image = image.convert("RGB")
-            image = train_resize(image)
-            if args.random_flip and random.random() < 0.5:
-                # flip
-                image = train_flip(image)
-            if args.center_crop:
-                y1 = max(0, int(round((image.height - args.resolution) / 2.0)))
-                x1 = max(0, int(round((image.width - args.resolution) / 2.0)))
-                image = train_crop(image)
-            else:
-                y1, x1, h, w = train_crop.get_params(image, (args.resolution, args.resolution))
-                image = crop(image, y1, x1, h, w)
-            image = train_transforms(image)
-            self.pixel_values.append(image)
-
-        self.num_instance_images = len(self.instance_images)
+        self.num_instance_images = len(self.instance_items)
+        if self.num_instance_images == 0:
+            raise ValueError("No instance images found.")
         self._length = self.num_instance_images
 
         if class_data_root is not None:
@@ -884,77 +1095,110 @@ class DreamBoothDataset(Dataset):
                 transforms.Normalize([0.5], [0.5]),
             ]
         )
-        
-        self.image_transforms_resize_and_crop = transforms.Compose(
+        self.train_transforms = transforms.Compose(
             [
-                transforms.Resize(size, interpolation=transforms.InterpolationMode.BILINEAR),
-                transforms.CenterCrop(size) if center_crop else transforms.RandomCrop(size),
+                transforms.ToTensor(),
+                transforms.Normalize([0.5], [0.5]),
             ]
         )
+
     def __len__(self):
         return self._length
 
-    def __getitem__(self, index):
+    def _load_instance_image(self, item):
+        if isinstance(item, (str, os.PathLike, Path)):
+            image_path = Path(item)
+            image = Image.open(image_path)
+        else:
+            image_path = None
+            image = item
+
+        image = exif_transpose(image)
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+        return image, image_path
+
+    def _build_example(self, index, include_debug=False):
         example = {}
-        
-        pil_image = Image.open(self.instance_images_path[index % self.num_instance_images])
-        if not pil_image.mode == "RGB":
-            pil_image = pil_image.convert("RGB")
-        pil_image = self.image_transforms_resize_and_crop(pil_image)
-        example["PIL_images"] = pil_image
-        example["image_path"] = self.instance_images_path[index % self.num_instance_images]
-        example["mask_data_path"] = self.mask_data_root
-        instance_image = self.pixel_values[index % self.num_instance_images]
-        #print(instance_image.shape)
-        example["instance_images"] = instance_image
+        item = self.instance_items[index % self.num_instance_images]
+        image, image_path = self._load_instance_image(item)
+
+        image = conditional_resize_for_resolution(image, self.size, Image.Resampling.BILINEAR)
+        flipped = False
+        if self.random_flip and random.random() < 0.5:
+            image = image.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+            flipped = True
+
+        crop_box = crop_params_for_resolution(image, self.size, self.center_crop)
+        crop_image = image.crop(crop_box)
+
+        if self.mask_source == "lama":
+            mask = generate_lama_mask(
+                crop_image.size,
+                self.size,
+                reject_by_area=self.lama_reject_by_area,
+                min_ratio=self.lama_mask_min_ratio,
+                max_ratio=self.lama_mask_max_ratio,
+                max_attempts=self.lama_mask_max_attempts,
+            )
+        else:
+            mask = load_folder_mask(
+                self.mask_data_root,
+                image_path,
+                image.size,
+                crop_box,
+                flipped=flipped,
+            )
+
+        example["instance_images"] = self.train_transforms(crop_image)
+        mask_tensor, masked_image = prepare_mask_and_masked_image(crop_image, mask)
+        example["masks"] = mask_tensor.squeeze(0)
+        example["masked_images"] = masked_image.squeeze(0)
 
         if self.custom_instance_prompts:
             caption = self.custom_instance_prompts[index % self.num_instance_images]
-            if caption:
-                example["instance_prompt"] = caption
-            else:
-                example["instance_prompt"] = self.instance_prompt
-
-        else:  # custom prompts were provided, but length does not match size of image dataset
+            example["instance_prompt"] = caption if caption else self.instance_prompt
+        else:
             example["instance_prompt"] = self.instance_prompt
 
         if self.class_data_root:
             class_image = Image.open(self.class_images_path[index % self.num_class_images])
             class_image = exif_transpose(class_image)
-
-            if not class_image.mode == "RGB":
+            if class_image.mode != "RGB":
                 class_image = class_image.convert("RGB")
             example["class_images"] = self.image_transforms(class_image)
             example["class_prompt"] = self.class_prompt
 
+        if include_debug:
+            example["debug_crop_image"] = crop_image
+            example["debug_mask_image"] = mask
+            example["debug_masked_image"] = mask_image_preview(crop_image, mask)
+            example["debug_mask_coverage"] = float(np.asarray(mask, dtype=np.uint8).mean() / 255.0)
+            example["debug_source_path"] = str(image_path) if image_path is not None else None
+
         return example
+
+    def debug_sample(self, index):
+        return self._build_example(index, include_debug=True)
+
+    def __getitem__(self, index):
+        return self._build_example(index, include_debug=False)
 
 
 def collate_fn(examples, with_prior_preservation=False):
     pixel_values = [example["instance_images"] for example in examples]
     prompts = [example["instance_prompt"] for example in examples]
+    masks = [example["masks"] for example in examples]
+    masked_images = [example["masked_images"] for example in examples]
 
-    # Concat class and instance examples for prior preservation.
-    # We do this to avoid doing two forward passes.
+    # Prior preservation is not part of the LaMa-mask baseline. Keep the
+    # original prompt/image concatenation behavior for compatibility.
     if with_prior_preservation:
         pixel_values += [example["class_images"] for example in examples]
         prompts += [example["class_prompt"] for example in examples]
-         
-    masks = []
-    masked_images = []    
-    for example in examples:
-            pil_image = example["PIL_images"]  # Here maybe PilImages
-            # Get Mask
-            mask = get_mask(pil_image.size, example["image_path"], example["mask_data_path"], 1, False)
-            # prepare mask and masked image
-            mask, masked_image = prepare_mask_and_masked_image(pil_image, mask)
 
-            masks.append(mask)
-            masked_images.append(masked_image)
-  
     pixel_values = torch.stack(pixel_values)
     pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
-    
     masks = torch.stack(masks)
     masked_images = torch.stack(masked_images)
 
@@ -1584,7 +1828,20 @@ def main(args):
         size=args.resolution,
         repeats=args.repeats,
         center_crop=args.center_crop,
+        random_flip=args.random_flip,
+        mask_source=args.mask_source,
+        lama_reject_by_area=args.lama_reject_by_area,
+        lama_mask_min_ratio=args.lama_mask_min_ratio,
+        lama_mask_max_ratio=args.lama_mask_max_ratio,
+        lama_mask_max_attempts=args.lama_mask_max_attempts,
     )
+    if args.debug_save_preprocessed_samples is not None and accelerator.is_main_process:
+        save_debug_preprocessed_samples(
+            train_dataset,
+            args.debug_save_preprocessed_samples,
+            args.debug_num_preprocessed_samples,
+        )
+    accelerator.wait_for_everyone()
 
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
